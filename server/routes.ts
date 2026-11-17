@@ -5,11 +5,13 @@ import fs from "fs";
 import { exec } from "child_process";
 import webpush from "web-push";
 import { db, pool } from "./db.js";
-import { users, shifts, attendance, leaveRequests, complaints, complaintPhotos, resignations, mutations, warningLetters, systemConfigs, activityLogs, announcements, pushSubscriptions, overtimes } from "../shared/schema.js";
+import { companies, users, shifts, attendance, leaveRequests, complaints, complaintPhotos, resignations, mutations, warningLetters, systemConfigs, activityLogs, announcements, pushSubscriptions, overtimes } from "../shared/schema.js";
 import { eq, ne, and, or, gte, lte, desc, sql, isNotNull, isNull, inArray } from "drizzle-orm";
 
 import { isAuthenticated, isAdmin, isSuperAdmin, hashPassword } from "./auth.js";
-import { uploadFile, isDriveConfigured, buildDriveFilename, DriveFolder, downloadFileStream } from "./services/googleDrive.js";
+import { uploadFile, isDriveConfigured, buildDriveFilename, DriveFolder, downloadFileStream, ensureCompanyDriveFolder } from "./services/googleDrive.js";
+import { registerMasterRoutes } from "./masterRoutes.js";
+import { getEffectiveCompanyId } from "./middleware/tenant.js";
 
 // Configure web-push
 const vapidPublicKey = process.env.VAPID_PUBLIC_KEY || "";
@@ -326,7 +328,8 @@ async function processSingleUpload(
   actionType: 'clockIn' | 'breakStart' | 'breakEnd' | 'clockOut' | 'lateReason' | 'complaint' | 'document' | 'profile' | 'overtimeSPL' | 'overtimeInitial' | 'overtimeFinal',
   fullName: string,
   docLabel?: string, // e.g. 'KTP', 'NPWP', 'BPJS', 'Profil'
-  base64Data?: string | null
+  base64Data?: string | null,
+  companyFolderId?: string | null
 ): Promise<string | null> {
   let fileBuffer: Buffer;
   let mimeType: string;
@@ -371,7 +374,7 @@ async function processSingleUpload(
   if (isDriveConfigured) {
     try {
       const driveFilename = buildDriveFilename(fullName, actionType, docLabel);
-      const result = await uploadFile(fileBuffer, driveFilename, mimeType, driveFolder);
+      const result = await uploadFile(fileBuffer, driveFilename, mimeType, driveFolder, companyFolderId);
       // Clean up local temp file after successful Drive upload
       if (tempFilePath) {
         try { fs.unlinkSync(tempFilePath); } catch (_) { /* ignore */ }
@@ -487,7 +490,8 @@ async function getEffectiveShiftForUser(userId: number, shiftIdHint?: number | n
 }
 
 export function registerRoutes(app: Express) {
-  
+  registerMasterRoutes(app);
+
   // Dynamic Manifest serving for PWA
   app.get("/manifest.json", async (req: Request, res: Response) => {
     res.setHeader("Content-Type", "application/json");
@@ -713,37 +717,44 @@ export function registerRoutes(app: Express) {
   // Dynamic application configuration endpoint
   app.get("/api/config", async (req: Request, res: Response) => {
     try {
-      const dbConfigs = await db.select().from(systemConfigs);
+      const companyId = getEffectiveCompanyId(req);
+      const [company] = await db.select().from(companies).where(eq(companies.id, companyId)).limit(1);
+      const dbConfigs = await db.select().from(systemConfigs).where(eq(systemConfigs.companyId, companyId));
       const configMap: Record<string, string> = {};
       dbConfigs.forEach(cfg => {
         configMap[cfg.key] = cfg.value;
       });
 
       res.json({
-        namaPt: configMap["namaPt"] ?? process.env.VITE_NAMA_PT ?? "PT ABCD",
-        singkatanPt: configMap["singkatanPt"] ?? process.env.VITE_SINGKATAN_PT ?? "PT ABC",
+        companyId,
+        slug: company?.slug ?? "ptabc",
+        namaPt: company?.name ?? configMap["namaPt"] ?? process.env.VITE_NAMA_PT ?? "PT ABCD",
+        singkatanPt: company?.shortName ?? configMap["singkatanPt"] ?? company?.name ?? process.env.VITE_SINGKATAN_PT ?? "PT ABC",
         deskripsiPwa: configMap["deskripsiPwa"] ?? process.env.VITE_DESKRIPSI_PWA ?? "Aplikasi Absensi Tenaga Kerja",
-        alamatPt: configMap["alamatPt"] ?? "",
-        logoUrl: configMap["logoUrl"] ?? process.env.VITE_LOGO_FILE ?? "",
-        logoInisial: configMap["logoInisial"] ?? process.env.VITE_LOGO_INISIAL ?? "",
+        alamatPt: company?.address ?? configMap["alamatPt"] ?? "",
+        logoUrl: company?.logoUrl ?? configMap["logoUrl"] ?? process.env.VITE_LOGO_FILE ?? "",
+        logoInisial: company?.logoInisial ?? configMap["logoInisial"] ?? process.env.VITE_LOGO_INISIAL ?? "",
         rekapPrefix: configMap["rekapPrefix"] ?? process.env.VITE_REKAP_FILE_PREFIX ?? "REKAP_ABSENSI",
-        cutoffStartDay: Number(configMap["cutoffStartDay"] ?? 21),
-        cutoffEndDay: Number(configMap["cutoffEndDay"] ?? 20),
-        themePrimary: configMap["themePrimary"] ?? process.env.VITE_THEME_PRIMARY_HSL ?? "24 95% 53%",
-        themeSecondary: configMap["themeSecondary"] ?? process.env.VITE_THEME_SECONDARY_HSL ?? "24 95% 43%",
-        themeAccent: configMap["themeAccent"] ?? process.env.VITE_THEME_ACCENT_HSL ?? "24 95% 93%",
-        themeBackground: configMap["themeBackground"] ?? process.env.VITE_THEME_BACKGROUND_HSL ?? "0 0% 100%",
-        themeSidebarAccent: configMap["themeSidebarAccent"] ?? process.env.VITE_THEME_SIDEBAR_ACCENT_HSL ?? "24 95% 97%",
+        cutoffStartDay: Number(company?.cutoffStartDay ?? configMap["cutoffStartDay"] ?? 1),
+        cutoffEndDay: Number(company?.cutoffEndDay ?? configMap["cutoffEndDay"] ?? 31),
+        themePrimary: company?.themePrimary ?? configMap["themePrimary"] ?? process.env.VITE_THEME_PRIMARY_HSL ?? "24 95% 53%",
+        themeSecondary: company?.themeSecondary ?? configMap["themeSecondary"] ?? process.env.VITE_THEME_SECONDARY_HSL ?? "24 95% 43%",
+        themeAccent: company?.themeAccent ?? configMap["themeAccent"] ?? process.env.VITE_THEME_ACCENT_HSL ?? "24 95% 93%",
+        themeBackground: company?.themeBackground ?? configMap["themeBackground"] ?? process.env.VITE_THEME_BACKGROUND_HSL ?? "0 0% 100%",
+        themeSidebarAccent: company?.themeSidebarAccent ?? configMap["themeSidebarAccent"] ?? process.env.VITE_THEME_SIDEBAR_ACCENT_HSL ?? "24 95% 97%",
         features: {
-          leave: (configMap["feature_leave"] ?? process.env.FEATURE_LEAVE) !== "false",
+          overtime: company?.enableOvertime ?? ((configMap["feature_overtime"] ?? "true") !== "false"),
+          leave: company?.enableLeave ?? ((configMap["feature_leave"] ?? process.env.FEATURE_LEAVE) !== "false"),
           recap: (configMap["feature_recap"] ?? process.env.FEATURE_RECAP) !== "false",
-          complaint: (configMap["feature_complaint"] ?? process.env.FEATURE_COMPLAINT) !== "false",
-          info: (configMap["feature_info"] ?? process.env.FEATURE_INFO) !== "false",
-          mutation: (configMap["feature_mutation"] ?? process.env.FEATURE_MUTATION) !== "false",
-          warningLetter: (configMap["feature_warningLetter"] ?? process.env.FEATURE_WARNING_LETTER) !== "false",
-          shift: (configMap["feature_shift"] ?? process.env.FEATURE_SHIFT) !== "false",
-          resignation: (configMap["feature_resignation"] ?? process.env.FEATURE_RESIGNATION) !== "false",
+          complaint: company?.enableComplaints ?? ((configMap["feature_complaint"] ?? process.env.FEATURE_COMPLAINT) !== "false"),
+          info: company?.enableAnnouncements ?? ((configMap["feature_info"] ?? process.env.FEATURE_INFO) !== "false"),
+          mutation: company?.enableHrActions ?? ((configMap["feature_mutation"] ?? process.env.FEATURE_MUTATION) !== "false"),
+          warningLetter: company?.enableHrActions ?? ((configMap["feature_warningLetter"] ?? process.env.FEATURE_WARNING_LETTER) !== "false"),
+          shift: company?.enableShifts ?? ((configMap["feature_shift"] ?? process.env.FEATURE_SHIFT) !== "false"),
+          resignation: company?.enableHrActions ?? ((configMap["feature_resignation"] ?? process.env.FEATURE_RESIGNATION) !== "false"),
           break: (configMap["feature_break"] ?? process.env.FEATURE_BREAK) !== "false",
+          permitExit: company?.enablePermitExit ?? true,
+          fakeGpsCheck: company?.enableFakeGpsCheck ?? true,
         },
         isDriveConfigured
       });
@@ -757,9 +768,10 @@ export function registerRoutes(app: Express) {
         logoUrl: process.env.VITE_LOGO_FILE || "",
         logoInisial: process.env.VITE_LOGO_INISIAL || "",
         rekapPrefix: process.env.VITE_REKAP_FILE_PREFIX || "REKAP_ABSENSI",
-        cutoffStartDay: 21,
-        cutoffEndDay: 20,
+        cutoffStartDay: 1,
+        cutoffEndDay: 31,
         features: {
+          overtime: true,
           leave: process.env.FEATURE_LEAVE !== "false",
           recap: process.env.FEATURE_RECAP !== "false",
           complaint: process.env.FEATURE_COMPLAINT !== "false",
@@ -769,6 +781,8 @@ export function registerRoutes(app: Express) {
           shift: process.env.FEATURE_SHIFT !== "false",
           resignation: process.env.FEATURE_RESIGNATION !== "false",
           break: process.env.FEATURE_BREAK !== "false",
+          permitExit: true,
+          fakeGpsCheck: true,
         },
         isDriveConfigured
       });
@@ -778,12 +792,40 @@ export function registerRoutes(app: Express) {
   // Admin endpoint to save configuration
   app.post("/api/admin/config", isAuthenticated, isSuperAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const {
         namaPt, singkatanPt, deskripsiPwa, alamatPt, logoUrl, logoInisial, rekapPrefix,
         cutoffStartDay, cutoffEndDay,
         themePrimary, themeSecondary, themeAccent, themeBackground, themeSidebarAccent,
         features
       } = req.body;
+
+      // Sync to companies table
+      const companyUpdate: any = {};
+      if (namaPt !== undefined) companyUpdate.name = String(namaPt);
+      if (singkatanPt !== undefined) companyUpdate.shortName = String(singkatanPt);
+      if (alamatPt !== undefined) companyUpdate.address = String(alamatPt);
+      if (logoUrl !== undefined) companyUpdate.logoUrl = String(logoUrl);
+      if (logoInisial !== undefined) companyUpdate.logoInisial = String(logoInisial);
+      if (cutoffStartDay !== undefined) companyUpdate.cutoffStartDay = Number(cutoffStartDay);
+      if (cutoffEndDay !== undefined) companyUpdate.cutoffEndDay = Number(cutoffEndDay);
+      if (themePrimary !== undefined) companyUpdate.themePrimary = String(themePrimary);
+      if (themeSecondary !== undefined) companyUpdate.themeSecondary = String(themeSecondary);
+      if (themeAccent !== undefined) companyUpdate.themeAccent = String(themeAccent);
+      if (themeBackground !== undefined) companyUpdate.themeBackground = String(themeBackground);
+      if (themeSidebarAccent !== undefined) companyUpdate.themeSidebarAccent = String(themeSidebarAccent);
+      if (features && typeof features === "object") {
+        if (features.overtime !== undefined) companyUpdate.enableOvertime = Boolean(features.overtime);
+        if (features.shift !== undefined) companyUpdate.enableShifts = Boolean(features.shift);
+        if (features.leave !== undefined) companyUpdate.enableLeave = Boolean(features.leave);
+        if (features.complaint !== undefined) companyUpdate.enableComplaints = Boolean(features.complaint);
+        if (features.info !== undefined) companyUpdate.enableAnnouncements = Boolean(features.info);
+        if (features.permitExit !== undefined) companyUpdate.enablePermitExit = Boolean(features.permitExit);
+        if (features.fakeGpsCheck !== undefined) companyUpdate.enableFakeGpsCheck = Boolean(features.fakeGpsCheck);
+      }
+      if (Object.keys(companyUpdate).length > 0) {
+        await db.update(companies).set(companyUpdate).where(eq(companies.id, companyId));
+      }
 
       const configsToSave: { key: string; value: string }[] = [];
       if (namaPt !== undefined) configsToSave.push({ key: "namaPt", value: String(namaPt) });
@@ -810,13 +852,19 @@ export function registerRoutes(app: Express) {
       const conn = await pool.getConnection();
       try {
         for (const cfg of configsToSave) {
-          await conn.query(
-            "INSERT INTO system_configs (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
-            [cfg.key, cfg.value]
+          const [existingRow]: any = await conn.query(
+            "SELECT id FROM system_configs WHERE company_id = ? AND `key` = ? LIMIT 1",
+            [companyId, cfg.key]
           );
+          if (existingRow.length > 0) {
+            await conn.query("UPDATE system_configs SET `value` = ? WHERE id = ?", [cfg.value, existingRow[0].id]);
+          } else {
+            await conn.query("INSERT INTO system_configs (company_id, `key`, `value`) VALUES (?, ?, ?)", [companyId, cfg.key, cfg.value]);
+          }
         }
         // Log to Activity Logs
         await db.insert(activityLogs).values({
+          companyId,
           userId: (req.user as any).id,
           action: "MENGUBAH_SISTEM_KONFIG",
           details: "Memperbarui konfigurasi sistem/tema warna perusahaan",
@@ -1253,6 +1301,7 @@ export function registerRoutes(app: Express) {
         const lateReasonPhoto = await processSingleUpload(files?.lateReasonPhoto?.[0], "lateReason", fullName, undefined, req.body.lateReasonPhoto);
 
         const newAttendance = {
+          companyId: getEffectiveCompanyId(req),
           userId,
           date: adminDate,
           checkIn: new Date(),
@@ -2914,19 +2963,20 @@ export function registerRoutes(app: Express) {
   // Dashboard Stats: total employees + present today
   app.get("/api/admin/stats", isAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const adminDate = getAdminDate();
       // Count all approved employees
       const allEmployees = await db
         .select()
         .from(users)
-        .where(and(eq(users.role, "employee"), eq(users.registrationStatus, "approved")));
+        .where(and(eq(users.companyId, companyId), eq(users.role, "employee"), eq(users.registrationStatus, "approved")));
       const totalEmployees = allEmployees.length;
 
       // Count unique employees who clocked in today
       const todayAttendance = await db
         .select()
         .from(attendance)
-        .where(sql`DATE(${attendance.date}) = ${adminDate}`);
+        .where(and(eq(attendance.companyId, companyId), sql`DATE(${attendance.date}) = ${adminDate}`));
       const presentUserIds = new Set(todayAttendance.map(a => a.userId));
       const presentToday = presentUserIds.size;
 
@@ -2939,10 +2989,11 @@ export function registerRoutes(app: Express) {
   // Dashboard Stats: pending complaints count
   app.get("/api/admin/complaints/stats", isAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const list = await db
         .select()
         .from(complaints)
-        .where(eq(complaints.status, "pending"));
+        .where(and(eq(complaints.companyId, companyId), eq(complaints.status, "pending")));
       res.json({ pendingCount: list.length });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -2952,10 +3003,11 @@ export function registerRoutes(app: Express) {
   // 1. Unverified employees list
   app.get("/api/admin/unverified-employees", isAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const list = await db
         .select()
         .from(users)
-        .where(eq(users.registrationStatus, "pending"));
+        .where(and(eq(users.companyId, companyId), eq(users.registrationStatus, "pending")));
       res.json(list);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -2968,11 +3020,12 @@ export function registerRoutes(app: Express) {
     const { action } = req.body; // "approve" or "reject"
 
     try {
+      const companyId = getEffectiveCompanyId(req);
       const status = action === "approve" ? "approved" : "rejected";
       await db
         .update(users)
         .set({ registrationStatus: status })
-        .where(eq(users.id, targetId));
+        .where(and(eq(users.id, targetId), eq(users.companyId, companyId)));
 
       res.json({ message: `Tenaga Kerja berhasil di-${action}` });
     } catch (err: any) {
@@ -2983,10 +3036,11 @@ export function registerRoutes(app: Express) {
   // 3. Get all active approved employees
   app.get("/api/admin/employees", isAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const list = await db
         .select()
         .from(users)
-        .where(and(eq(users.role, "employee"), eq(users.registrationStatus, "approved")));
+        .where(and(eq(users.companyId, companyId), eq(users.role, "employee"), eq(users.registrationStatus, "approved")));
       res.json(list);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -2996,9 +3050,11 @@ export function registerRoutes(app: Express) {
   // Get all users for admin list
   app.get("/api/admin/users", isAdmin, async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const list = await db
         .select()
-        .from(users);
+        .from(users)
+        .where(eq(users.companyId, companyId));
       res.json(list);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -3011,6 +3067,7 @@ export function registerRoutes(app: Express) {
       return res.status(403).json({ message: "Akses ditolak: Khusus Super Admin" });
     }
     try {
+      const companyId = getEffectiveCompanyId(req);
       const list = await db
         .select({
           id: activityLogs.id,
@@ -3023,6 +3080,7 @@ export function registerRoutes(app: Express) {
         })
         .from(activityLogs)
         .leftJoin(users, eq(activityLogs.userId, users.id))
+        .where(eq(activityLogs.companyId, companyId))
         .orderBy(desc(activityLogs.createdAt));
 
       res.json(list);
@@ -3040,6 +3098,7 @@ export function registerRoutes(app: Express) {
     { name: "kkPhoto", maxCount: 1 },
   ]), async (req: Request, res: Response) => {
     try {
+      const companyId = getEffectiveCompanyId(req);
       const { 
         fullName, username, password, role, nik, branch, position, email,
         phoneNumber, religion, npwp, bpjs, birthPlace, birthDate, gender,
@@ -3051,20 +3110,21 @@ export function registerRoutes(app: Express) {
         return res.status(400).json({ message: "Semua kolom wajib diisi" });
       }
 
-      // Check if username already exists
+      // Check if username already exists in this company
       const [existingUser] = await db
         .select()
         .from(users)
-        .where(eq(users.username, username))
+        .where(and(eq(users.companyId, companyId), eq(users.username, username)))
         .limit(1);
 
       if (existingUser) {
-        return res.status(400).json({ message: "Username sudah digunakan" });
+        return res.status(400).json({ message: "Username sudah digunakan di PT ini" });
       }
 
       const hashedPassword = await hashPassword(password);
       
       const insertData: any = {
+        companyId,
         fullName,
         username,
         password: hashedPassword,
@@ -3272,7 +3332,8 @@ export function registerRoutes(app: Express) {
   // 5. Shift management
   app.get("/api/shifts", isAuthenticated, async (req: Request, res: Response) => {
     try {
-      const list = await db.select().from(shifts);
+      const companyId = getEffectiveCompanyId(req);
+      const list = await db.select().from(shifts).where(eq(shifts.companyId, companyId));
       res.json(list);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -3285,7 +3346,9 @@ export function registerRoutes(app: Express) {
       return res.status(400).json({ message: "Data shift tidak lengkap" });
     }
     try {
+      const companyId = getEffectiveCompanyId(req);
       await db.insert(shifts).values({
+        companyId,
         name,
         checkInTime,
         checkOutTime,
@@ -3300,6 +3363,7 @@ export function registerRoutes(app: Express) {
   app.patch("/api/admin/shifts/:id", isAdmin, async (req: Request, res: Response) => {
     const { name, checkInTime, checkOutTime, description } = req.body;
     try {
+      const companyId = getEffectiveCompanyId(req);
       await db.update(shifts)
         .set({
           ...(name && { name }),
@@ -3307,7 +3371,7 @@ export function registerRoutes(app: Express) {
           ...(checkOutTime && { checkOutTime }),
           ...(description !== undefined && { description: description || null }),
         })
-        .where(eq(shifts.id, Number(req.params.id)));
+        .where(and(eq(shifts.id, Number(req.params.id)), eq(shifts.companyId, companyId)));
       res.json({ message: "Shift berhasil diperbarui" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -3316,7 +3380,8 @@ export function registerRoutes(app: Express) {
 
   app.delete("/api/admin/shifts/:id", isAdmin, async (req: Request, res: Response) => {
     try {
-      await db.delete(shifts).where(eq(shifts.id, Number(req.params.id)));
+      const companyId = getEffectiveCompanyId(req);
+      await db.delete(shifts).where(and(eq(shifts.id, Number(req.params.id)), eq(shifts.companyId, companyId)));
       res.json({ message: "Shift berhasil dihapus" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -3795,9 +3860,10 @@ export function registerRoutes(app: Express) {
     const { startDate, endDate } = req.query;
 
     try {
+      const companyId = getEffectiveCompanyId(req);
       let query = db.select().from(attendance);
       
-      const filters = [];
+      const filters = [eq(attendance.companyId, companyId)];
       if (startDate) {
         filters.push(sql`DATE(${attendance.date}) >= ${startDate}`);
       }
@@ -3805,9 +3871,7 @@ export function registerRoutes(app: Express) {
         filters.push(sql`DATE(${attendance.date}) <= ${endDate}`);
       }
 
-      if (filters.length > 0) {
-        query = query.where(and(...filters)) as any;
-      }
+      query = query.where(and(...filters)) as any;
 
       const list = await query.orderBy(desc(attendance.date), desc(attendance.sessionNumber));
       res.json(list);
@@ -3827,8 +3891,9 @@ export function registerRoutes(app: Express) {
     const targetUserId = isUserAdmin ? parsedUserId : (req.user as any).id;
 
     try {
+      const companyId = getEffectiveCompanyId(req);
       let query = db.select().from(attendance);
-      const filters = [];
+      const filters = [eq(attendance.companyId, companyId)];
 
       if (targetUserId) {
         filters.push(eq(attendance.userId, targetUserId));
@@ -3844,9 +3909,7 @@ export function registerRoutes(app: Express) {
         filters.push(sql`DATE_FORMAT(${attendance.date}, '%Y-%m') = ${prefix}`);
       }
 
-      if (filters.length > 0) {
-        query = query.where(and(...filters)) as any;
-      }
+      query = query.where(and(...filters)) as any;
 
       const list = await query.orderBy(desc(attendance.date), desc(attendance.sessionNumber));
       res.json(list);

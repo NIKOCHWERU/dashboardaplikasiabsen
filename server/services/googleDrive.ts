@@ -1,5 +1,6 @@
 import { google } from 'googleapis';
 import { Stream } from 'stream';
+import { getCurrentDriveFolderId } from '../middleware/tenant.js';
 
 const CLIENT_ID = process.env.GOOGLE_DRIVE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_DRIVE_CLIENT_SECRET;
@@ -34,24 +35,59 @@ if (oauth2Client && REFRESH_TOKEN) {
 
 const drive = oauth2Client ? google.drive({ version: 'v3', auth: oauth2Client }) : null;
 
-// Cache subfolder IDs to avoid repeated lookups
+// Cache subfolder IDs to avoid repeated lookups: key = `${parentId}:${folderName}`
 const subfolderCache: Record<string, string> = {};
 
-// Get or create a subfolder inside ROOT_FOLDER_ID
-async function getOrCreateSubfolder(folderName: 'Absensi' | 'Dokumen' | 'Pengaduan' | 'Lembur'): Promise<string> {
-    if (subfolderCache[folderName]) return subfolderCache[folderName];
-    if (!drive || !ROOT_FOLDER_ID) throw new Error("Drive not configured");
+// Get or create a company folder inside ROOT_FOLDER_ID
+export async function ensureCompanyDriveFolder(companyName: string, existingFolderId?: string | null): Promise<string | null> {
+    if (!isDriveConfigured || !drive || !ROOT_FOLDER_ID) return null;
+    if (existingFolderId) return existingFolderId;
+
+    await ensureValidToken();
+
+    const safeName = companyName.replace(/'/g, "\\'");
+    const res = await drive.files.list({
+        q: `'${ROOT_FOLDER_ID}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        fields: 'files(id, name)',
+        pageSize: 1,
+    });
+
+    if (res.data.files && res.data.files.length > 0) {
+        return res.data.files[0].id!;
+    }
+
+    const created = await drive.files.create({
+        requestBody: {
+            name: companyName,
+            mimeType: 'application/vnd.google-apps.folder',
+            parents: [ROOT_FOLDER_ID],
+        },
+        fields: 'id',
+    });
+
+    const folderId = created.data.id!;
+    console.log(`📁 Google Drive: Created company folder "${companyName}" (${folderId})`);
+    return folderId;
+}
+
+// Get or create a subfolder inside parentFolderId (defaults to ROOT_FOLDER_ID)
+async function getOrCreateSubfolder(folderName: DriveFolder, parentFolderId?: string | null): Promise<string> {
+    const parentId = parentFolderId || ROOT_FOLDER_ID;
+    if (!drive || !parentId) throw new Error("Drive not configured");
+
+    const cacheKey = `${parentId}:${folderName}`;
+    if (subfolderCache[cacheKey]) return subfolderCache[cacheKey];
 
     // Search for existing subfolder
     const res = await drive.files.list({
-        q: `'${ROOT_FOLDER_ID}' in parents and name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        q: `'${parentId}' in parents and name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         fields: 'files(id, name)',
         pageSize: 1,
     });
 
     if (res.data.files && res.data.files.length > 0) {
         const folderId = res.data.files[0].id!;
-        subfolderCache[folderName] = folderId;
+        subfolderCache[cacheKey] = folderId;
         return folderId;
     }
 
@@ -60,14 +96,14 @@ async function getOrCreateSubfolder(folderName: 'Absensi' | 'Dokumen' | 'Pengadu
         requestBody: {
             name: folderName,
             mimeType: 'application/vnd.google-apps.folder',
-            parents: [ROOT_FOLDER_ID],
+            parents: [parentId],
         },
         fields: 'id',
     });
 
     const folderId = created.data.id!;
-    console.log(`📁 Google Drive: Created subfolder "${folderName}" (${folderId})`);
-    subfolderCache[folderName] = folderId;
+    console.log(`📁 Google Drive: Created subfolder "${folderName}" in parent ${parentId} (${folderId})`);
+    subfolderCache[cacheKey] = folderId;
     return folderId;
 }
 
@@ -122,13 +158,14 @@ export function buildDriveFilename(
     return `${cleanName}_${date}_${action}_${timeStr}.jpg`;
 }
 
-export type DriveFolder = 'Absensi' | 'Dokumen' | 'Pengaduan' | 'Lembur';
+export type DriveFolder = 'Absensi' | 'Dokumen' | 'Pengaduan' | 'Lembur' | 'Logo';
 
 export async function uploadFile(
     fileBuffer: Buffer,
     fileName: string,
     mimeType: string,
-    folder: DriveFolder = 'Dokumen'
+    folder: DriveFolder = 'Dokumen',
+    companyFolderId?: string | null
 ): Promise<{ fileId: string; viewUrl: string }> {
     if (!isDriveConfigured || !drive) {
         throw new Error("Google Drive is not configured");
@@ -136,7 +173,8 @@ export async function uploadFile(
 
     await ensureValidToken();
 
-    const folderId = await getOrCreateSubfolder(folder);
+    const resolvedCompanyFolder = companyFolderId ?? getCurrentDriveFolderId();
+    const folderId = await getOrCreateSubfolder(folder, resolvedCompanyFolder);
 
     const bufferStream = new Stream.PassThrough();
     bufferStream.end(fileBuffer);

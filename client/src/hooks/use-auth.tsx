@@ -7,7 +7,8 @@ interface User {
   email: string | null;
   username: string;
   fullName: string;
-  role: "admin" | "employee" | "superadmin";
+  role: "master_admin" | "admin" | "employee" | "superadmin";
+  companyId?: number | null;
   nik: string | null;
   branch: string | null;
   position: string | null;
@@ -84,18 +85,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         credentials: "include",
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.message || "Login gagal");
+        const text = await res.text();
+        let msg = "Login gagal";
+        try {
+          const parsed = JSON.parse(text);
+          msg = parsed.message || msg;
+        } catch {
+          if (text && !text.trim().startsWith("<")) msg = text;
+          else msg = `Server error (${res.status})`;
+        }
+        throw new Error(msg);
       }
       return await res.json();
     },
     onSuccess: async (data) => {
       queryClient.setQueryData(["/api/user"], data);
-      if (data.role === "employee") {
+      if (data.role === "master_admin") {
+        setLocation("/");
+      } else if (data.role === "employee") {
         if (data.registrationStatus === "pending") {
           setLocation("/employee/pending");
         } else if (data.registrationStatus === "approved") {
-          setLocation("/employee");
+          setLocation("/karyawan");
         } else {
           setLocation("/employee/registration");
         }
@@ -116,7 +127,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     },
     onSuccess: async () => {
       queryClient.setQueryData(["/api/user"], null);
-      if (window.location.pathname.startsWith("/admin")) {
+      if (window.location.pathname.includes("/admin")) {
         setLocation("/admin/login");
       } else {
         setLocation("/login");

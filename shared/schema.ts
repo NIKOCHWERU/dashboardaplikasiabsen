@@ -3,14 +3,45 @@ import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 import { relations } from "drizzle-orm";
 
+export const companies = mysqlTable("companies", {
+  id: int("id").primaryKey().autoincrement(),
+  name: varchar("name", { length: 255 }).notNull(),
+  slug: varchar("slug", { length: 100 }).unique().notNull(),
+  shortName: varchar("short_name", { length: 100 }),
+  logoUrl: text("logo_url"),
+  logoInisial: varchar("logo_inisial", { length: 10 }),
+  address: text("address"),
+  phone: varchar("phone", { length: 50 }),
+  email: varchar("email", { length: 255 }),
+  themePrimary: varchar("theme_primary", { length: 50 }).default("122 39% 49%"),
+  themeSecondary: varchar("theme_secondary", { length: 50 }).default("210 40% 96.1%"),
+  themeAccent: varchar("theme_accent", { length: 50 }).default("210 40% 96.1%"),
+  themeBackground: varchar("theme_background", { length: 50 }).default("0 0% 100%"),
+  themeSidebarAccent: varchar("theme_sidebar_accent", { length: 50 }).default("210 40% 96.1%"),
+  driveFolderId: varchar("drive_folder_id", { length: 255 }),
+  enableOvertime: boolean("enable_overtime").default(true),
+  enableShifts: boolean("enable_shifts").default(true),
+  enableLeave: boolean("enable_leave").default(true),
+  enableComplaints: boolean("enable_complaints").default(true),
+  enableFakeGpsCheck: boolean("enable_fake_gps_check").default(true),
+  enablePermitExit: boolean("enable_permit_exit").default(true),
+  enableAnnouncements: boolean("enable_announcements").default(true),
+  enableHrActions: boolean("enable_hr_actions").default(true),
+  cutoffStartDay: int("cutoff_start_day").default(1),
+  cutoffEndDay: int("cutoff_end_day").default(31),
+  isActive: boolean("is_active").default(true),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
 export const users = mysqlTable("users", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id"), // Null for master_admin, company ID for PT users
   email: varchar("email", { length: 255 }), // Nullable for employees
-  username: varchar("username", { length: 255 }).unique(), // Can be NIK for employees
+  username: varchar("username", { length: 255 }), // Can be NIK for employees
   password: varchar("password", { length: 255 }).notNull(),
   fullName: varchar("full_name", { length: 255 }).notNull(),
-  role: mysqlEnum("role", ["admin", "employee", "superadmin"]).notNull().default("employee"),
-  nik: varchar("nik", { length: 50 }).unique(), // Specific for employees
+  role: mysqlEnum("role", ["master_admin", "admin", "employee", "superadmin"]).notNull().default("employee"),
+  nik: varchar("nik", { length: 50 }), // Specific for employees
   branch: varchar("branch", { length: 100 }),
   position: varchar("position", { length: 100 }),
   shift: varchar("shift", { length: 50 }),
@@ -38,6 +69,7 @@ export const users = mysqlTable("users", {
 
 export const shifts = mysqlTable("shifts", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   name: varchar("name", { length: 50 }).notNull(),
   checkInTime: varchar("check_in_time", { length: 10 }).notNull(), // HH:mm
   checkOutTime: varchar("check_out_time", { length: 10 }).notNull(), // HH:mm
@@ -46,6 +78,7 @@ export const shifts = mysqlTable("shifts", {
 
 export const attendance = mysqlTable("attendance", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   date: date("date").notNull(), // YYYY-MM-DD
 
@@ -83,6 +116,7 @@ export const attendance = mysqlTable("attendance", {
 
 export const overtimes = mysqlTable("overtimes", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   attendanceId: int("attendance_id").notNull(),
   startTime: timestamp("start_time").notNull(),
   endTime: timestamp("end_time"),
@@ -106,6 +140,7 @@ export const overtimes = mysqlTable("overtimes", {
 
 export const announcements = mysqlTable("announcements", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   title: varchar("title", { length: 255 }).notNull(),
   content: text("content").notNull(),
   imageUrl: varchar("image_url", { length: 512 }),
@@ -118,6 +153,7 @@ export const announcements = mysqlTable("announcements", {
 
 export const complaints = mysqlTable("complaints", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   title: varchar("title", { length: 255 }).notNull(),
   description: text("description").notNull(),
@@ -133,6 +169,7 @@ export const complaints = mysqlTable("complaints", {
 
 export const leaveRequests = mysqlTable("leave_requests", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   startDate: date("start_date").notNull(),
   endDate: date("end_date").notNull(),
@@ -172,6 +209,7 @@ export const pushSubscriptions = mysqlTable("push_subscriptions", {
 // Resignations Table
 export const resignations = mysqlTable("resignations", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   resignDate: date("resign_date").notNull(),
   reason: text("reason").notNull(),
@@ -185,6 +223,7 @@ export const resignations = mysqlTable("resignations", {
 // Mutations, Promotions, Demotions Table
 export const mutations = mysqlTable("mutations", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   type: mysqlEnum("type", ["mutasi", "promosi", "demosi"]).notNull(),
   oldBranch: varchar("old_branch", { length: 100 }),
@@ -202,6 +241,7 @@ export const mutations = mysqlTable("mutations", {
 // Warning Letters Table (SP1, SP2, SP3)
 export const warningLetters = mysqlTable("warning_letters", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   type: mysqlEnum("type", ["SP1", "SP2", "SP3"]).notNull(),
   startDate: date("start_date").notNull(),
@@ -217,13 +257,15 @@ export const warningLetters = mysqlTable("warning_letters", {
 // System Configurations Table
 export const systemConfigs = mysqlTable("system_configs", {
   id: int("id").primaryKey().autoincrement(),
-  key: varchar("key", { length: 255 }).unique().notNull(),
+  companyId: int("company_id").default(1),
+  key: varchar("key", { length: 255 }).notNull(),
   value: text("value").notNull(),
 });
 
 // Activity Logs Table
 export const activityLogs = mysqlTable("activity_logs", {
   id: int("id").primaryKey().autoincrement(),
+  companyId: int("company_id").default(1),
   userId: int("user_id").notNull(),
   action: varchar("action", { length: 255 }).notNull(),
   details: text("details").notNull(),
@@ -312,6 +354,7 @@ export const warningLettersRelations = relations(warningLetters, ({ one }) => ({
 }));
 
 // Schemas
+export const insertCompanySchema = createInsertSchema(companies).omit({ id: true, createdAt: true });
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertShiftSchema = createInsertSchema(shifts).omit({ id: true });
 export const insertAttendanceSchema = createInsertSchema(attendance).omit({ id: true });
@@ -326,6 +369,8 @@ export const insertSystemConfigSchema = createInsertSchema(systemConfigs).omit({
 export const insertActivityLogSchema = createInsertSchema(activityLogs).omit({ id: true, createdAt: true });
 
 // Types
+export type Company = typeof companies.$inferSelect;
+export type InsertCompany = z.infer<typeof insertCompanySchema>;
 export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type Shift = typeof shifts.$inferSelect;

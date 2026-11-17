@@ -4,6 +4,31 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "./lib/queryClient.js";
 import App from "./App.js";
 import "./index.css";
+import { getTenantSlugFromPath } from "./lib/tenant.js";
+
+// Wrap window.fetch to automatically prefix /absensi on /api and /uploads, and inject tenant header
+const originalFetch = window.fetch.bind(window);
+window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  let url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+  if (url.startsWith("/api/") || url.startsWith("/uploads/")) {
+    url = `/absensi${url}`;
+  }
+
+  const slug = getTenantSlugFromPath();
+  const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
+  if (slug) {
+    if (!headers.has("X-Tenant-Slug")) headers.set("X-Tenant-Slug", slug);
+  } else {
+    if (!headers.has("X-Master-Context")) headers.set("X-Master-Context", "true");
+  }
+
+  const nextInit: RequestInit = { ...init, headers };
+  if (typeof input === "string" || input instanceof URL) {
+    return originalFetch(url, nextInit);
+  }
+  return originalFetch(new Request(url, input), nextInit);
+};
 
 // Dynamic Theme Injection from environment variables (.env)
 const injectTheme = () => {

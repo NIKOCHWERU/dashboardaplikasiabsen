@@ -8,10 +8,21 @@ import { registerRoutes } from "./routes.js";
 import { pool } from "./db.js";
 import { startBackupScheduler } from "./backup.js";
 import { startAutoCheckoutScheduler } from "./autoCheckout.js";
+import { resolveTenant } from "./middleware/tenant.js";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// Support /absensi/api/... and /absensi/uploads/... when hosted under /absensi subpath
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  if (req.url.startsWith("/absensi/api/")) {
+    req.url = req.url.replace(/^\/absensi/, "");
+  } else if (req.url.startsWith("/absensi/uploads/")) {
+    req.url = req.url.replace(/^\/absensi/, "");
+  }
+  next();
+});
 
 // Dynamic DB Schema check and Auto-Migration
 async function runAutoMigrations() {
@@ -277,6 +288,8 @@ async function runAutoMigrations() {
     await checkAndAddColumn("users", "bpjs", "VARCHAR(50) NULL");
     await checkAndAddColumn("users", "npwp_photo_url", "VARCHAR(512) NULL");
     await checkAndAddColumn("users", "bpjs_photo_url", "VARCHAR(512) NULL");
+    await checkAndAddColumn("users", "kk_number", "VARCHAR(50) NULL");
+    await checkAndAddColumn("users", "kk_photo_url", "VARCHAR(512) NULL");
     await checkAndAddColumn("users", "ktp_photo_url", "VARCHAR(512) NULL");
 
     await checkAndAddColumn("attendance", "late_reason", "TEXT NULL");
@@ -294,28 +307,124 @@ async function runAutoMigrations() {
       await conn.query("ALTER TABLE overtimes MODIFY COLUMN employee_approval ENUM('pending', 'approved', 'rejected') DEFAULT 'pending'");
     } catch (e) { console.log("Overtimes column modify note:", e); }
 
-    // --- Default admin seeding ---
-    const [adminCheck]: any = await conn.query(`SELECT id FROM users WHERE role = 'admin' LIMIT 1`);
+    // --- Multi-Tenant Companies Table & Migrations ---
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS companies (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(100) UNIQUE NOT NULL,
+        short_name VARCHAR(100) NULL,
+        logo_url TEXT NULL,
+        logo_inisial VARCHAR(10) NULL,
+        address TEXT NULL,
+        phone VARCHAR(50) NULL,
+        email VARCHAR(255) NULL,
+        theme_primary VARCHAR(50) DEFAULT '122 39% 49%',
+        theme_secondary VARCHAR(50) DEFAULT '210 40% 96.1%',
+        theme_accent VARCHAR(50) DEFAULT '210 40% 96.1%',
+        theme_background VARCHAR(50) DEFAULT '0 0% 100%',
+        theme_sidebar_accent VARCHAR(50) DEFAULT '210 40% 96.1%',
+        drive_folder_id VARCHAR(255) NULL,
+        enable_overtime BOOLEAN DEFAULT TRUE,
+        enable_shifts BOOLEAN DEFAULT TRUE,
+        enable_leave BOOLEAN DEFAULT TRUE,
+        enable_complaints BOOLEAN DEFAULT TRUE,
+        enable_fake_gps_check BOOLEAN DEFAULT TRUE,
+        enable_permit_exit BOOLEAN DEFAULT TRUE,
+        enable_announcements BOOLEAN DEFAULT TRUE,
+        enable_hr_actions BOOLEAN DEFAULT TRUE,
+        cutoff_start_day INT DEFAULT 1,
+        cutoff_end_day INT DEFAULT 31,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await checkAndAddColumn("users", "company_id", "INT NULL");
+    await checkAndAddColumn("shifts", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("attendance", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("overtimes", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("announcements", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("complaints", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("leave_requests", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("resignations", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("mutations", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("warning_letters", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("system_configs", "company_id", "INT DEFAULT 1");
+    await checkAndAddColumn("activity_logs", "company_id", "INT DEFAULT 1");
+
+    try {
+      await conn.query("ALTER TABLE users MODIFY COLUMN role ENUM('master_admin', 'admin', 'employee', 'superadmin') NOT NULL DEFAULT 'employee'");
+    } catch (e) { console.log("Users role enum note:", e); }
+
+    // Drop legacy global unique indexes on users.username, users.nik, system_configs.key if present
+    for (const [tbl, col] of [["users", "username"], ["users", "nik"], ["system_configs", "key"]] as const) {
+      try {
+        const [idxRows]: any = await conn.query(`
+          SELECT INDEX_NAME FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND NON_UNIQUE = 0 AND INDEX_NAME != 'PRIMARY'
+        `, [tbl, col]);
+        for (const r of idxRows) {
+          if (!r.INDEX_NAME.startsWith("idx_mt_")) {
+            await conn.query(`ALTER TABLE ${tbl} DROP INDEX \`${r.INDEX_NAME}\``);
+          }
+        }
+      } catch (e) {
+        // Ignore if already dropped
+      }
+    }
+
+    // --- Default Company Seeding (PT ABC) ---
+    const [compCheck]: any = await conn.query(`SELECT id FROM companies LIMIT 1`);
+    let defaultCompanyId = 1;
+    if (compCheck.length === 0) {
+      console.log("Seeding default company PT ABC...");
+      const [ins]: any = await conn.query(`
+        INSERT INTO companies (name, slug, short_name, logo_inisial, cutoff_start_day, cutoff_end_day)
+        VALUES ('PT ABC', 'ptabc', 'PT ABC', 'A', 1, 31)
+      `);
+      defaultCompanyId = ins.insertId;
+    } else {
+      defaultCompanyId = compCheck[0].id;
+    }
+
+    // Assign any legacy users (non-master_admin) without company_id to default company
+    await conn.query(`UPDATE users SET company_id = ? WHERE company_id IS NULL AND role != 'master_admin'`, [defaultCompanyId]);
+
+    // --- Master Admin Seeding (admin_nh) ---
+    const [masterCheck]: any = await conn.query(`SELECT id FROM users WHERE role = 'master_admin' LIMIT 1`);
+    if (masterCheck.length === 0) {
+      console.log("Seeding default master_admin (admin_nh)...");
+      const masterPass = process.env.MASTER_ADMIN_PASSWORD || "admin123";
+      const masterHash = await hashPassword(masterPass);
+      await conn.query(`
+        INSERT INTO users (company_id, username, password, full_name, role, registration_status, is_admin)
+        VALUES (NULL, 'admin_nh', ?, 'Master Admin NH', 'master_admin', 'approved', TRUE)
+      `, [masterHash]);
+      console.log("Master Admin seeded: User 'admin_nh' / Pass '" + masterPass + "'");
+    }
+
+    // --- Default admin seeding for default company ---
+    const [adminCheck]: any = await conn.query(`SELECT id FROM users WHERE company_id = ? AND role IN ('admin', 'superadmin') LIMIT 1`, [defaultCompanyId]);
     if (adminCheck.length === 0) {
-      console.log("Seeding default admin user...");
+      console.log("Seeding default superadmin user for default company...");
       const passHash = await hashPassword("admin123");
       await conn.query(`
-        INSERT INTO users (username, password, full_name, role, registration_status, is_admin)
-        VALUES ('admin', ?, 'Administrator', 'admin', 'approved', TRUE)
-      `, [passHash]);
-      console.log("Seeding completed: User 'admin' / Pass 'admin123'");
+        INSERT INTO users (company_id, username, password, full_name, role, registration_status, is_admin)
+        VALUES (?, 'admin', ?, 'Administrator', 'superadmin', 'approved', TRUE)
+      `, [defaultCompanyId, passHash]);
     }
 
     // --- Default shifts seeding ---
-    const [shiftCheck]: any = await conn.query(`SELECT id FROM shifts LIMIT 1`);
+    const [shiftCheck]: any = await conn.query(`SELECT id FROM shifts WHERE company_id = ? LIMIT 1`, [defaultCompanyId]);
     if (shiftCheck.length === 0) {
       console.log("Seeding default shifts...");
       await conn.query(`
-        INSERT INTO shifts (name, check_in_time, check_out_time, description)
+        INSERT INTO shifts (company_id, name, check_in_time, check_out_time, description)
         VALUES 
-        ('Shift Pagi (Normal)', '08:00', '17:00', 'Shift pagi utama senin-jumat'),
-        ('Shift Sore', '14:00', '22:00', 'Shift sore/malam operasional')
-      `);
+        (?, 'Shift Pagi (Normal)', '08:00', '17:00', 'Shift pagi utama senin-jumat'),
+        (?, 'Shift Sore', '14:00', '22:00', 'Shift sore/malam operasional')
+      `, [defaultCompanyId, defaultCompanyId]);
     }
 
     console.log("Database checks and auto-migrations finished successfully.");
@@ -329,6 +438,7 @@ async function runAutoMigrations() {
 async function startServer() {
   await runAutoMigrations();
   app.set("trust proxy", 1);
+  app.use(resolveTenant);
   setupAuth(app);
   
   // Serve uploads folder statically so frontend can access /uploads/... images
@@ -336,6 +446,14 @@ async function startServer() {
   app.use("/uploads", express.static(uploadDir));
   
   registerRoutes(app);
+
+  // Global JSON error handler for API routes
+  app.use("/api", (err: any, _req: Request, res: Response, _next: NextFunction) => {
+    console.error("API Error:", err);
+    const status = err.status || err.statusCode || 500;
+    res.status(status).json({ message: err.message || "Internal Server Error" });
+  });
+
   startBackupScheduler();
   startAutoCheckoutScheduler();
 
@@ -373,19 +491,21 @@ async function startServer() {
       }
     });
   } else {
-    // Host production build bundle
+    // Host production build bundle under /absensi and /
     const distPath = path.resolve(process.cwd(), "dist/public");
-    
-    app.use(express.static(distPath, {
-      setHeaders: (res) => {
+    const staticOpts = {
+      setHeaders: (res: Response) => {
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
         res.setHeader("Pragma", "no-cache");
         res.setHeader("Expires", "0");
       }
-    }));
+    };
 
-    app.get("*", (req: Request, res: Response) => {
-      if (req.path.startsWith('/assets/')) {
+    app.use("/absensi", express.static(distPath, staticOpts));
+    app.use(express.static(distPath, staticOpts));
+
+    app.get(["/absensi", "/absensi/*", "*"], (req: Request, res: Response) => {
+      if (req.path.includes('/assets/')) {
         return res.status(404).send("Not found");
       }
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
@@ -396,7 +516,7 @@ async function startServer() {
   }
 
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server listening on port ${PORT} (http://localhost:${PORT})`);
+    console.log(`Server listening on port ${PORT} (http://localhost:${PORT}/absensi/)`);
   });
 }
 

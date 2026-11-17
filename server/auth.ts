@@ -7,7 +7,7 @@ import crypto from "crypto";
 import { Express, Request, Response, NextFunction } from "express";
 import { db, pool } from "./db.js";
 import { users } from "../shared/schema.js";
-import { eq } from "drizzle-orm";
+import { eq, and, or } from "drizzle-orm";
 
 const { scrypt, randomBytes } = crypto;
 
@@ -62,35 +62,64 @@ export function setupAuth(app: Express) {
   app.use(passport.session());
 
   passport.use(
-    new LocalStrategy(async (username, password, done) => {
-      try {
-        // Query user from DB (check both username and nik)
-        const [user] = await db
-          .select()
-          .from(users)
-          .where(eq(users.username, username))
-          .limit(1);
+    new LocalStrategy(
+      { passReqToCallback: true },
+      async (req: Request, username: string, password: string, done) => {
+        try {
+          let user: any;
 
-        if (!user) {
-          return done(null, false, { message: "Username atau NIK tidak ditemukan" });
-        }
+          if (req.tenant) {
+            // Tenant-scoped login (admin, superadmin, or employee of this PT)
+            if (!req.tenant.isActive) {
+              return done(null, false, { message: "Perusahaan sedang dinonaktifkan" });
+            }
+            const [found] = await db
+              .select()
+              .from(users)
+              .where(
+                and(
+                  eq(users.companyId, req.tenant.id),
+                  or(eq(users.username, username), eq(users.nik, username))
+                )
+              )
+              .limit(1);
+            user = found;
+          } else {
+            // Master Dashboard login (master_admin only)
+            const [found] = await db
+              .select()
+              .from(users)
+              .where(
+                and(
+                  eq(users.role, "master_admin"),
+                  eq(users.username, username)
+                )
+              )
+              .limit(1);
+            user = found;
+          }
 
-        // Employee password check is bypassed (NIK-only login)
-        if (user.role === "employee") {
+          if (!user) {
+            return done(null, false, { message: "Username atau NIK tidak ditemukan" });
+          }
+
+          // Employee password check is bypassed (NIK-only login)
+          if (user.role === "employee") {
+            return done(null, user);
+          }
+
+          // Master Admin, Admins and Superadmins require password check
+          const isValid = await comparePasswords(password, user.password);
+          if (!isValid) {
+            return done(null, false, { message: "Kata sandi salah" });
+          }
+
           return done(null, user);
+        } catch (err) {
+          return done(err);
         }
-
-        // Admins and Superadmins require password check
-        const isValid = await comparePasswords(password, user.password);
-        if (!isValid) {
-          return done(null, false, { message: "Kata sandi salah" });
-        }
-
-        return done(null, user);
-      } catch (err) {
-        return done(err);
       }
-    })
+    )
   );
 
   passport.serializeUser((user: any, done) => {
@@ -109,12 +138,18 @@ export function setupAuth(app: Express) {
   // API Endpoints for Auth
   app.post("/api/login", (req: Request, res: Response, next: NextFunction) => {
     passport.authenticate("local", (err: any, user: any, info: any) => {
-      if (err) return next(err);
+      if (err) {
+        console.error("Login authenticate error:", err);
+        return res.status(500).json({ message: err.message || "Terjadi kesalahan saat login" });
+      }
       if (!user) {
         return res.status(401).json({ message: info?.message || "Login gagal" });
       }
-      req.logIn(user, (err) => {
-        if (err) return next(err);
+      req.logIn(user, (loginErr) => {
+        if (loginErr) {
+          console.error("req.logIn error:", loginErr);
+          return res.status(500).json({ message: loginErr.message || "Gagal membuat sesi login" });
+        }
         return res.json(user);
       });
     })(req, res, next);
@@ -134,22 +169,49 @@ export function setupAuth(app: Express) {
     if (!req.isAuthenticated()) {
       return res.status(401).json({ message: "Belum masuk" });
     }
-    res.json(req.user);
+    const u = req.user as any;
+    // If accessing a specific PT context, ensure session user belongs to that PT
+    if (req.tenant && u.companyId !== req.tenant.id) {
+      return res.status(401).json({ message: "Sesi tidak sesuai dengan PT ini" });
+    }
+    // If accessing Master Dashboard (no tenant header), only master_admin is valid
+    if (!req.tenant && u.role !== "master_admin" && req.headers["x-master-context"] === "true") {
+      return res.status(401).json({ message: "Bukan sesi Master Admin" });
+    }
+    res.json(u);
   });
 }
 
 // Middlewares
 export function isAuthenticated(req: Request, res: Response, next: NextFunction) {
-  if (req.isAuthenticated()) return next();
-  res.status(401).json({ message: "Silakan login terlebih dahulu" });
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ message: "Silakan login terlebih dahulu" });
+  }
+  const u = req.user as any;
+  if (req.tenant && u.role !== "master_admin" && u.companyId !== req.tenant.id) {
+    return res.status(403).json({ message: "Akses ditolak: User bukan bagian dari PT ini" });
+  }
+  return next();
 }
 
 export function isAdmin(req: Request, res: Response, next: NextFunction) {
-  if (req.isAuthenticated() && (req.user as any).role !== "employee") return next();
+  if (req.isAuthenticated() && ["admin", "superadmin"].includes((req.user as any).role)) {
+    const u = req.user as any;
+    if (req.tenant && u.companyId !== req.tenant.id) {
+      return res.status(403).json({ message: "Akses ditolak: Bukan admin PT ini" });
+    }
+    return next();
+  }
   res.status(403).json({ message: "Akses ditolak: Khusus Admin" });
 }
 
 export function isSuperAdmin(req: Request, res: Response, next: NextFunction) {
-  if (req.isAuthenticated() && (req.user as any).role === "superadmin") return next();
+  if (req.isAuthenticated() && (req.user as any).role === "superadmin") {
+    const u = req.user as any;
+    if (req.tenant && u.companyId !== req.tenant.id) {
+      return res.status(403).json({ message: "Akses ditolak: Bukan superadmin PT ini" });
+    }
+    return next();
+  }
   res.status(403).json({ message: "Akses ditolak: Khusus Superadmin" });
 }

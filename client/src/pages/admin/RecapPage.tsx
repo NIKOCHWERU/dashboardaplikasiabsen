@@ -700,13 +700,6 @@ export default function RecapPage() {
         }
     });
 
-
-    const activeEmployeeList = useMemo(() => {
-        return (users || [])
-            .filter(u => !isAdminUser(u) && !isResignedUser(u))
-            .sort((a, b) => (a.fullName || '').localeCompare(b.fullName || '', 'id'));
-    }, [users, allResignations]);
-
     // ========== RINGKASAN BULANAN: Pisah hari kerja reguler (Senin-Jumat) vs lembur ==========
     const ringkasanData = useMemo(() => {
         if (!users) return [];
