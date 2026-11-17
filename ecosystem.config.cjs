@@ -1,13 +1,13 @@
 module.exports = {
   apps: [
     {
-      name: "absen-ptmip",
+      name: "dashboard-absensi",
       script: "node_modules/.bin/tsx",
       args: "server/index.ts",
-      cwd: "/var/www/absensi-pt-mip",
+      cwd: "/var/www/dashboardaplikasiabsen",
       env: {
         NODE_ENV: "production",
-        PORT: 3008,
+        PORT: 3483,
       },
       instances: 1,
       autorestart: true,
