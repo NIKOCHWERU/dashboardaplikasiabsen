@@ -21,6 +21,14 @@ export function getTenantSlugFromPath(pathname?: string): string | null {
   return firstSegment;
 }
 
+export function resolveAssetUrl(url: string | null | undefined): string {
+  if (!url) return "";
+  if (url.startsWith("/api/") || url.startsWith("/uploads/")) {
+    return `/absensi${url}`;
+  }
+  return url;
+}
+
 export function hexToHslString(hex: string): string {
   const clean = hex.replace("#", "");
   if (clean.length !== 6) return "43 74% 49%";

@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { hexToHslString, hslStringToHex } from "@/lib/tenant";
+import { hexToHslString, hslStringToHex, resolveAssetUrl } from "@/lib/tenant";
 import {
   Building2,
   Plus,
@@ -447,7 +447,7 @@ export default function MasterDashboardPage() {
                         >
                           {c.logoUrl ? (
                             <img
-                              src={c.logoUrl}
+                              src={resolveAssetUrl(c.logoUrl)}
                               alt={c.name}
                               className="w-full h-full object-contain p-1"
                             />
@@ -751,7 +751,7 @@ export default function MasterDashboardPage() {
                 <div className="flex items-center gap-4">
                   <div className="w-14 h-14 rounded-xl border border-amber-200 bg-amber-50/40 flex items-center justify-center overflow-hidden shrink-0">
                     {logoPreview ? (
-                      <img src={logoPreview} alt="Preview" className="w-full h-full object-contain p-1" />
+                      <img src={resolveAssetUrl(logoPreview)} alt="Preview" className="w-full h-full object-contain p-1" />
                     ) : (
                       <Building2 className="w-6 h-6 text-amber-400" />
                     )}

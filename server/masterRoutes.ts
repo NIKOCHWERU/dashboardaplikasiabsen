@@ -389,7 +389,7 @@ export function registerMasterRoutes(app: Express) {
             const ext = path.extname(req.file.originalname) || ".png";
             const fileName = `Logo_${company.slug}_${Date.now()}${ext}`;
             const uploaded = await uploadFile(req.file.buffer, fileName, req.file.mimetype, "Logo", folderId);
-            logoUrl = `/api/gdrive-img/${uploaded.fileId}`;
+            logoUrl = `/absensi/api/gdrive-img/${uploaded.fileId}`;
           } catch (driveErr) {
             console.warn("Drive logo upload failed, falling back to local:", driveErr);
           }
@@ -401,7 +401,7 @@ export function registerMasterRoutes(app: Express) {
           const ext = path.extname(req.file.originalname) || ".png";
           const fileName = `logo_${company.slug}_${Date.now()}${ext}`;
           fs.writeFileSync(path.join(uploadDir, fileName), req.file.buffer);
-          logoUrl = `/uploads/${fileName}`;
+          logoUrl = `/absensi/uploads/${fileName}`;
         }
 
         await db.update(companies).set({ logoUrl }).where(eq(companies.id, id));
